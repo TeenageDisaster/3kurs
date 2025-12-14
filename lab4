@@ -1,0 +1,188 @@
+ЧАСТИНА 1 — Атрибути файлу (GetFileAttributes, GetFileSize, GetFileTime, GetSecurityInfo)
+#include <windows.h>
+#include <iostream>
+#include <Aclapi.h>
+
+void PrintFileAttributes(const std::wstring& path) {
+    WIN32_FILE_ATTRIBUTE_DATA data;
+
+    if (!GetFileAttributesEx(path.c_str(), GetFileExInfoStandard, &data)) {
+        std::wcout << L"Error: GetFileAttributesEx failed: " << GetLastError() << "\n";
+        return;
+    }
+
+    DWORD attr = data.dwFileAttributes;
+    std::wcout << L"Attributes:\n";
+    if (attr & FILE_ATTRIBUTE_DIRECTORY) std::wcout << L" - Directory\n";
+    if (attr & FILE_ATTRIBUTE_HIDDEN) std::wcout << L" - Hidden\n";
+    if (attr & FILE_ATTRIBUTE_READONLY) std::wcout << L" - ReadOnly\n";
+    if (attr & FILE_ATTRIBUTE_SYSTEM) std::wcout << L" - System\n";
+    if (attr & FILE_ATTRIBUTE_ARCHIVE) std::wcout << L" - Archive\n";
+
+    LARGE_INTEGER size;
+    size.LowPart = data.nFileSizeLow;
+    size.HighPart = data.nFileSizeHigh;
+    std::wcout << L"Size: " << size.QuadPart << " bytes\n";
+
+    FILETIME ftCreate, ftAccess, ftWrite;
+    ftCreate = data.ftCreationTime;
+    ftAccess = data.ftLastAccessTime;
+    ftWrite  = data.ftLastWriteTime;
+
+    SYSTEMTIME st;
+    FileTimeToSystemTime(&ftCreate, &st);
+    std::wcout << L"Created: " << st.wDay << L"." << st.wMonth << L"." << st.wYear 
+               << L" " << st.wHour << L":" << st.wMinute << "\n";
+
+    FileTimeToSystemTime(&ftAccess, &st);
+    std::wcout << L"Last Access: " << st.wDay << L"." << st.wMonth << L"." << st.wYear 
+               << L" " << st.wHour << L":" << st.wMinute << "\n";
+
+    FileTimeToSystemTime(&ftWrite, &st);
+    std::wcout << L"Last Write: " << st.wDay << L"." << st.wMonth << L"." << st.wYear
+               << L" " << st.wHour << L":" << st.wMinute << "\n";
+
+    // Власник файлу
+    PSID pOwnerSID = NULL;
+    PSECURITY_DESCRIPTOR pSD = NULL;
+    DWORD res = GetNamedSecurityInfo(
+        path.c_str(),
+        SE_FILE_OBJECT,
+        OWNER_SECURITY_INFORMATION,
+        &pOwnerSID,
+        NULL, NULL, NULL, &pSD
+    );
+
+    if (res == ERROR_SUCCESS) {
+        LPWSTR ownerName = NULL;
+        LPWSTR domainName = NULL;
+        DWORD cchName = 0, cchDomain = 0;
+        SID_NAME_USE sidType;
+
+        LookupAccountSid(NULL, pOwnerSID, NULL, &cchName, NULL, &cchDomain, &sidType);
+
+        ownerName = (LPWSTR)malloc(cchName * sizeof(WCHAR));
+        domainName = (LPWSTR)malloc(cchDomain * sizeof(WCHAR));
+
+        LookupAccountSid(NULL, pOwnerSID, ownerName, &cchName, domainName, &cchDomain, &sidType);
+
+        std::wcout << L"Owner: " << domainName << L"\\" << ownerName << L"\n";
+
+        LocalFree(pSD);
+        free(ownerName);
+        free(domainName);
+    }
+}
+
+✅ ЧАСТИНА 2 — Читання великого файлу
+2.1 Буферизовано (fopen/fread/fwrite)
+#include <chrono>
+
+void ReadBuffered(const char* in, const char* out) {
+    FILE* fin = fopen(in, "rb");
+    FILE* fout = fopen(out, "wb");
+    if (!fin || !fout) {
+        std::cout << "Error opening files\n";
+        return;
+    }
+
+    const size_t BUF = 1024 * 1024;
+    char* buffer = new char[BUF];
+
+    auto start = std::chrono::high_resolution_clock::now();
+
+    size_t bytes;
+    while ((bytes = fread(buffer, 1, BUF, fin)) > 0) {
+        fwrite(buffer, 1, bytes, fout);
+    }
+
+    auto end = std::chrono::high_resolution_clock::now();
+    std::cout << "Buffered I/O time: "
+              << std::chrono::duration<double>(end - start).count()
+              << " sec\n";
+
+    delete[] buffer;
+    fclose(fin);
+    fclose(fout);
+}
+
+2.2 Небуферизовано (CreateFile / ReadFile / WriteFile)
+void ReadUnbuffered(const wchar_t* in, const wchar_t* out) {
+    HANDLE hIn = CreateFile(in, GENERIC_READ, FILE_SHARE_READ,
+        NULL, OPEN_EXISTING, FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+
+    HANDLE hOut = CreateFile(out, GENERIC_WRITE, 0,
+        NULL, CREATE_ALWAYS, FILE_FLAG_NO_BUFFERING, NULL);
+
+    if (hIn == INVALID_HANDLE_VALUE || hOut == INVALID_HANDLE_VALUE) {
+        std::cout << "CreateFile error\n";
+        return;
+    }
+
+    const DWORD BUF = 4096 * 4; // має бути кратний розміру сектора
+    char* buffer = (char*)_aligned_malloc(BUF, 4096);
+
+    auto start = std::chrono::high_resolution_clock::now();
+
+    DWORD readBytes, writtenBytes;
+    while (ReadFile(hIn, buffer, BUF, &readBytes, NULL) && readBytes > 0) {
+        WriteFile(hOut, buffer, readBytes, &writtenBytes, NULL);
+    }
+
+    auto end = std::chrono::high_resolution_clock::now();
+    std::cout << "Unbuffered I/O time: "
+              << std::chrono::duration<double>(end - start).count()
+              << " sec\n";
+
+    _aligned_free(buffer);
+    CloseHandle(hIn);
+    CloseHandle(hOut);
+}
+
+🟦 Повні висновки, які ти маєш отримати у звіті
+Метод	Швидкість	Коментар
+fopen/fread/fwrite	повільніше	працює через власний буфер CRT
+CreateFile/ReadFile без буфера	швидше на SSD / великих файлах	мінімізує копіювання, читає “як є”
+Асинхронне I/O	найшвидше при великій кількості файлів	CPU не блокується, працюють кілька потоків I/O
+✅ ЧАСТИНА 3 — Асинхронне читання кількох файлів (OVERLAPPED)
+struct AsyncRead {
+    HANDLE file;
+    OVERLAPPED ovl;
+    char buffer[4096];
+};
+
+void AsyncReadMultiple(const std::vector<std::wstring>& files) {
+    std::vector<AsyncRead> ops(files.size());
+
+    for (size_t i = 0; i < files.size(); i++) {
+        ops[i].file = CreateFile(
+            files[i].c_str(),
+            GENERIC_READ,
+            FILE_SHARE_READ,
+            NULL,
+            OPEN_EXISTING,
+            FILE_FLAG_OVERLAPPED,
+            NULL
+        );
+
+        ZeroMemory(&ops[i].ovl, sizeof(OVERLAPPED));
+        ops[i].ovl.Offset = 0;
+        ops[i].ovl.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+
+        ReadFile(ops[i].file, ops[i].buffer, sizeof(ops[i].buffer), NULL, &ops[i].ovl);
+    }
+
+    std::vector<HANDLE> events;
+    for (auto& op : ops) events.push_back(op.ovl.hEvent);
+
+    WaitForMultipleObjects(events.size(), events.data(), TRUE, INFINITE);
+
+    for (size_t i = 0; i < ops.size(); i++) {
+        DWORD bytes;
+        GetOverlappedResult(ops[i].file, &ops[i].ovl, &bytes, TRUE);
+        std::cout << "File " << i << " read: " << bytes << " bytes\n";
+
+        CloseHandle(ops[i].file);
+        CloseHandle(ops[i].ovl.hEvent);
+    }
+}
