@@ -1,0 +1,134 @@
+// save as createproc_timeout.cpp
+#include <windows.h>
+#include <iostream>
+#include <string>
+
+int wmain(int argc, wchar_t* argv[])
+{
+    // Якщо користувач не вказав програму у аргументах — використовуємо notepad.exe
+    std::wstring cmdline;
+    if (argc >= 2) {
+        // Об'єднуємо всі аргументи в одну командну строку
+        for (int i = 1; i < argc; ++i) {
+            if (i > 1) cmdline += L" ";
+            // Якщо аргумент містить пробіли — обгортаємо в лапки
+            bool hasSpace = wcschr(argv[i], L' ') != nullptr;
+            if (hasSpace) cmdline += L"\"";
+            cmdline += argv[i];
+            if (hasSpace) cmdline += L"\"";
+        }
+    } else {
+        cmdline = L"notepad.exe";
+    }
+
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    ZeroMemory(&pi, sizeof(pi));
+
+    // CreateProcess вимагає змінний буфер на lpCommandLine
+    std::unique_ptr<wchar_t[]> cmdBuf(new wchar_t[cmdline.size() + 1]);
+    wcscpy_s(cmdBuf.get(), cmdline.size() + 1, cmdline.c_str());
+
+    // Запускаємо процес (без нового середовища, без змін безпеки)
+    BOOL ok = CreateProcessW(
+        nullptr,                // lpApplicationName (NULL - використовуємо командну строку)
+        cmdBuf.get(),           // lpCommandLine (мутований буфер)
+        nullptr,                // lpProcessAttributes
+        nullptr,                // lpThreadAttributes
+        FALSE,                  // bInheritHandles
+        0,                      // dwCreationFlags
+        nullptr,                // lpEnvironment
+        nullptr,                // lpCurrentDirectory
+        &si,                    // lpStartupInfo
+        &pi                     // lpProcessInformation
+    );
+
+    if (!ok) {
+        DWORD err = GetLastError();
+        std::wcerr << L"CreateProcess failed, GetLastError() = " << err << L"\n";
+        return 1;
+    }
+
+    std::wcout << L"Process started. PID = " << pi.dwProcessId << L"\n";
+
+    // Таймаут в мілісекундах
+    const DWORD TIMEOUT_MS = 10000; // 10 секунд
+    const DWORD POLL_INTERVAL_MS = 500; // перевірка кожні 0.5 с
+
+    DWORD elapsed = 0;
+    DWORD waitResult = 0;
+    bool terminatedByTimeout = false;
+
+    // Цикл: перевіряємо процес інтервалами, виходимо якщо завершився або якщо перевищено таймаут
+    while (true) {
+        // Чекаємо з таймаутом POLL_INTERVAL_MS
+        waitResult = WaitForSingleObject(pi.hProcess, POLL_INTERVAL_MS);
+
+        if (waitResult == WAIT_OBJECT_0) {
+            // процес завершився
+            std::wcout << L"Child process signaled termination.\n";
+            break;
+        } else if (waitResult == WAIT_TIMEOUT) {
+            elapsed += POLL_INTERVAL_MS;
+            // Додатковно можна отримати код виходу, щоб переконатись, що процес ще активний
+            DWORD exitCode = 0;
+            if (GetExitCodeProcess(pi.hProcess, &exitCode)) {
+                if (exitCode != STILL_ACTIVE) {
+                    std::wcout << L"GetExitCodeProcess показує код виходу: " << exitCode << L"\n";
+                    break;
+                }
+            } else {
+                std::wcout << L"GetExitCodeProcess failed\n";
+                break;
+            }
+
+            if (elapsed >= TIMEOUT_MS) {
+                // Перевищено таймаут — примусово завершуємо дочірній процес
+                std::wcout << L"Timeout (" << TIMEOUT_MS/1000 << L"s) exceeded. Terminating process...\n";
+                if (TerminateProcess(pi.hProcess, 1)) {
+                    terminatedByTimeout = true;
+                    // Після TerminateProcess можна почекати ще трохи, щоб Windows відмітив процес як завершений
+                    WaitForSingleObject(pi.hProcess, 5000);
+                } else {
+                    DWORD terr = GetLastError();
+                    std::wcerr << L"TerminateProcess failed, GetLastError() = " << terr << L"\n";
+                }
+                break;
+            } else {
+                std::wcout << L"Elapsed: " << elapsed/1000.0 << L"s — процес все ще виконується...\r";
+                // Продовжити цикл
+            }
+        } else {
+            std::wcerr << L"WaitForSingleObject failed with code " << waitResult << L"\n";
+            break;
+        }
+    }
+
+    // Отримуємо остаточний код виходу процесу
+    DWORD finalExitCode = 0;
+    if (GetExitCodeProcess(pi.hProcess, &finalExitCode)) {
+        if (finalExitCode == STILL_ACTIVE) {
+            std::wcout << L"Процес все ще вважається активним (це дивно) — exit code = " << finalExitCode << L"\n";
+        } else {
+            std::wcout << L"Final exit code: " << finalExitCode << L"\n";
+            if (terminatedByTimeout) {
+                std::wcout << L"Процес був примусово завершений через таймаут.\n";
+            } else if (finalExitCode == 0) {
+                std::wcout << L"Процес завершився успішно (код 0).\n";
+            } else {
+                std::wcout << L"Процес завершився з кодом помилки: " << finalExitCode << L"\n";
+            }
+        }
+    } else {
+        DWORD err = GetLastError();
+        std::wcerr << L"GetExitCodeProcess failed, GetLastError() = " << err << L"\n";
+    }
+
+    // Закриваємо дескриптори
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    return 0;
+}
