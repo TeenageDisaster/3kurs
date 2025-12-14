@@ -1,0 +1,348 @@
+1) TCP-сервер (мультипотоковий) — tcp_server.cpp
+// tcp_server.cpp
+// Компіль: cl /EHsc tcp_server.cpp Ws2_32.lib
+// або: g++ -std=c++17 tcp_server.cpp -lws2_32 -o tcp_server
+
+#define _CRT_SECURE_NO_WARNINGS
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <process.h> // _beginthreadex
+#include <windows.h>
+#include <iostream>
+#include <vector>
+#include <string>
+
+#pragma comment(lib, "Ws2_32.lib")
+
+static const int BACKLOG = 10;
+
+// Надійні функції для відправки/прийому всіх байтів
+bool send_all(SOCKET s, const char* buf, int len) {
+    int sent = 0;
+    while (sent < len) {
+        int n = send(s, buf + sent, len - sent, 0);
+        if (n == SOCKET_ERROR) return false;
+        sent += n;
+    }
+    return true;
+}
+
+bool recv_all(SOCKET s, char* buf, int len) {
+    int recvd = 0;
+    while (recvd < len) {
+        int n = recv(s, buf + recvd, len - recvd, 0);
+        if (n <= 0) return false;
+        recvd += n;
+    }
+    return true;
+}
+
+// Простий frame: 4-byte length (network byte order) + payload
+bool send_frame(SOCKET s, const std::string& payload) {
+    uint32_t n = (uint32_t)payload.size();
+    uint32_t net_n = htonl(n);
+    if (!send_all(s, (char*)&net_n, 4)) return false;
+    if (n > 0) return send_all(s, payload.data(), (int)n);
+    return true;
+}
+
+bool recv_frame(SOCKET s, std::string& out_payload) {
+    uint32_t net_n;
+    if (!recv_all(s, (char*)&net_n, 4)) return false;
+    uint32_t n = ntohl(net_n);
+    if (n == 0) { out_payload.clear(); return true; }
+    out_payload.resize(n);
+    if (!recv_all(s, &out_payload[0], (int)n)) return false;
+    return true;
+}
+
+// Потік обробки клієнта
+unsigned __stdcall client_thread(void* param) {
+    SOCKET client = (SOCKET)(uintptr_t)param;
+    std::cout << "[+] Client thread started: " << client << "\n";
+
+    std::string msg;
+    while (true) {
+        if (!recv_frame(client, msg)) {
+            std::cout << "[-] Client disconnected or error: " << client << "\n";
+            break;
+        }
+        std::cout << "[<] Received (" << client << "): " << msg << "\n";
+
+        // Ехо з додатковим текстом. Тут можна робити розбір JSON/команд, відповіді тощо.
+        std::string resp = "Server echo: " + msg;
+        if (!send_frame(client, resp)) {
+            std::cout << "[-] Send failed\n";
+            break;
+        }
+    }
+
+    closesocket(client);
+    return 0;
+}
+
+int main(int argc, char** argv) {
+    WSADATA wsa;
+    if (WSAStartup(MAKEWORD(2,2), &wsa) != 0) {
+        std::cerr << "WSAStartup failed\n"; return 1;
+    }
+
+    const char* port = (argc >= 2) ? argv[1] : "5000";
+    addrinfo hints{}, *res;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_PASSIVE;
+    if (getaddrinfo(NULL, port, &hints, &res) != 0) {
+        std::cerr << "getaddrinfo failed\n"; WSACleanup(); return 1;
+    }
+
+    SOCKET listen_sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (listen_sock == INVALID_SOCKET) { std::cerr << "socket failed\n"; freeaddrinfo(res); WSACleanup(); return 1; }
+
+    int yes = 1;
+    setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, (char*)&yes, sizeof(yes));
+
+    if (bind(listen_sock, res->ai_addr, (int)res->ai_addrlen) == SOCKET_ERROR) {
+        std::cerr << "bind failed\n"; closesocket(listen_sock); freeaddrinfo(res); WSACleanup(); return 1;
+    }
+    freeaddrinfo(res);
+
+    if (listen(listen_sock, BACKLOG) == SOCKET_ERROR) {
+        std::cerr << "listen failed\n"; closesocket(listen_sock); WSACleanup(); return 1;
+    }
+
+    std::cout << "TCP server listening on port " << port << "\n";
+
+    while (true) {
+        sockaddr_in clientAddr; int addrlen = sizeof(clientAddr);
+        SOCKET client = accept(listen_sock, (sockaddr*)&clientAddr, &addrlen);
+        if (client == INVALID_SOCKET) {
+            std::cerr << "accept failed\n"; break;
+        }
+        char ipstr[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &clientAddr.sin_addr, ipstr, sizeof(ipstr));
+        std::cout << "[+] Connection from " << ipstr << ":" << ntohs(clientAddr.sin_port) << "\n";
+
+        // створюємо потік для обробки
+        uintptr_t p = (uintptr_t)client;
+        unsigned threadId;
+        HANDLE h = (HANDLE)_beginthreadex(NULL, 0, client_thread, (void*)p, 0, &threadId);
+        if (h) CloseHandle(h); // не чекаємо завершення — потоки самі закриються
+    }
+
+    closesocket(listen_sock);
+    WSACleanup();
+    return 0;
+}
+
+
+Запуск
+
+tcp_server.exe 5000
+
+2) TCP-клієнт з JSON-передачею — tcp_client.cpp
+// tcp_client.cpp
+// Компіль: cl /EHsc tcp_client.cpp Ws2_32.lib
+// або: g++ -std=c++17 tcp_client.cpp -lws2_32 -o tcp_client
+
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <iostream>
+#include <string>
+#include <vector>
+#pragma comment(lib, "Ws2_32.lib")
+
+// (включи 'json.hpp' у ту ж папку та #include "json.hpp" якщо хочеш використовувати json)
+// #include "json.hpp"
+// using json = nlohmann::json;
+
+// send_all / recv_all / send_frame / recv_frame як у сервері
+bool send_all(SOCKET s, const char* buf, int len) {
+    int sent = 0;
+    while (sent < len) {
+        int n = send(s, buf + sent, len - sent, 0);
+        if (n == SOCKET_ERROR) return false;
+        sent += n;
+    }
+    return true;
+}
+bool recv_all(SOCKET s, char* buf, int len) {
+    int recvd = 0;
+    while (recvd < len) {
+        int n = recv(s, buf + recvd, len - recvd, 0);
+        if (n <= 0) return false;
+        recvd += n;
+    }
+    return true;
+}
+bool send_frame(SOCKET s, const std::string& payload) {
+    uint32_t n = (uint32_t)payload.size();
+    uint32_t net_n = htonl(n);
+    if (!send_all(s, (char*)&net_n, 4)) return false;
+    if (n > 0) return send_all(s, payload.data(), (int)n);
+    return true;
+}
+bool recv_frame(SOCKET s, std::string& out_payload) {
+    uint32_t net_n;
+    if (!recv_all(s, (char*)&net_n, 4)) return false;
+    uint32_t n = ntohl(net_n);
+    out_payload.resize(n);
+    if (n == 0) return true;
+    if (!recv_all(s, &out_payload[0], (int)n)) return false;
+    return true;
+}
+
+int main(int argc, char** argv) {
+    if (argc < 3) {
+        std::cout << "Usage: tcp_client <server_ip> <server_port>\n";
+        return 0;
+    }
+    const char* server = argv[1];
+    const char* port = argv[2];
+
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2,2), &wsa);
+
+    addrinfo hints{}, *res;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(server, port, &hints, &res) != 0) {
+        std::cerr << "getaddrinfo failed\n"; WSACleanup(); return 1;
+    }
+
+    SOCKET s = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (connect(s, res->ai_addr, (int)res->ai_addrlen) == SOCKET_ERROR) {
+        std::cerr << "connect failed\n"; closesocket(s); freeaddrinfo(res); WSACleanup(); return 1;
+    }
+    freeaddrinfo(res);
+
+    std::cout << "Connected. Type lines to send. Type 'quit' to exit.\n";
+
+    std::string line;
+    while (true) {
+        std::getline(std::cin, line);
+        if (line == "quit") break;
+
+        // Приклад: можна відправляти JSON — якщо підключено nlohmann::json
+        // json j; j["cmd"] = "echo"; j["text"] = line;
+        // std::string payload = j.dump();
+
+        // Інакше просто відправляємо текст
+        std::string payload = line;
+        if (!send_frame(s, payload)) { std::cerr << "send failed\n"; break; }
+
+        std::string resp;
+        if (!recv_frame(s, resp)) { std::cerr << "recv failed\n"; break; }
+        std::cout << "[server] " << resp << "\n";
+    }
+
+    closesocket(s);
+    WSACleanup();
+    return 0;
+}
+
+
+Запуск
+
+tcp_client.exe 127.0.0.1 5000
+
+
+Пиши рядки — сервер відповідає.
+
+3) UDP-чат (простий) — udp_chat.cpp
+// udp_chat.cpp
+// Компіль: cl /EHsc udp_chat.cpp Ws2_32.lib
+// або: g++ -std=c++17 udp_chat.cpp -lws2_32 -o udp_chat
+// Запуск: udp_chat.exe <local_port> <peer_ip> <peer_port>
+// приклад: на машині A: udp_chat 6000 192.168.0.2 6001
+//          на машині B: udp_chat 6001 192.168.0.1 6000
+
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <iostream>
+#include <thread>
+#include <string>
+#pragma comment(lib, "Ws2_32.lib")
+
+int main(int argc, char** argv) {
+    if (argc < 4) { std::cout << "Usage: udp_chat <local_port> <peer_ip> <peer_port>\n"; return 0; }
+    const char* local_port = argv[1];
+    const char* peer_ip = argv[2];
+    const char* peer_port = argv[3];
+
+    WSADATA w; WSAStartup(MAKEWORD(2,2), &w);
+
+    addrinfo hints{}, *localinfo, *peerinfo;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_flags = AI_PASSIVE;
+    getaddrinfo(NULL, local_port, &hints, &localinfo);
+    getaddrinfo(peer_ip, peer_port, &hints, &peerinfo);
+
+    SOCKET s = socket(localinfo->ai_family, localinfo->ai_socktype, localinfo->ai_protocol);
+    bind(s, localinfo->ai_addr, (int)localinfo->ai_addrlen);
+
+    std::cout << "UDP chat started. Sending to " << peer_ip << ":" << peer_port << "\n";
+
+    // Потік прийому
+    std::thread recv_thread([&](){
+        char buf[2048];
+        sockaddr_in from; int fromlen = sizeof(from);
+        while (true) {
+            int n = recvfrom(s, buf, sizeof(buf)-1, 0, (sockaddr*)&from, &fromlen);
+            if (n <= 0) break;
+            buf[n] = 0;
+            char addrstr[INET_ADDRSTRLEN]; inet_ntop(AF_INET, &from.sin_addr, addrstr, sizeof(addrstr));
+            std::cout << "\n[" << addrstr << ":" << ntohs(from.sin_port) << "] " << buf << "\n> ";
+            fflush(stdout);
+        }
+    });
+
+    // Потік відправки (основний)
+    std::string line;
+    sockaddr* peeraddr = peerinfo->ai_addr;
+    int peeraddrlen = (int)peerinfo->ai_addrlen;
+    while (true) {
+        std::cout << "> ";
+        if (!std::getline(std::cin, line)) break;
+        if (line == "quit") break;
+        sendto(s, line.c_str(), (int)line.size(), 0, peeraddr, peeraddrlen);
+    }
+
+    closesocket(s);
+    recv_thread.join();
+    freeaddrinfo(localinfo); freeaddrinfo(peerinfo);
+    WSACleanup();
+    return 0;
+}
+
+4) Передача структур/JSON — як інтегрувати
+
+Варіант A (реком. налагоджений): використовувати nlohmann/json (single header).
+
+Завантаж json.hpp та поклади поруч із .cpp.
+
+У клієнті/сервері додай:
+
+#include "json.hpp"
+using json = nlohmann::json;
+
+
+Приклад серіалізації структури в клієнті перед відправкою:
+
+json j;
+j["type"] = "person";
+j["id"] = 42;
+j["name"] = "Denis";
+j["score"] = 123.4;
+std::string payload = j.dump(); // отримали JSON-рядок
+send_frame(sock, payload);
+
+
+На сервері після отримання:
+
+std::string payload;
+recv_frame(sock, payload);
+json j = json::parse(payload);
+std::string type = j["type"];
+int id = j["id"];
