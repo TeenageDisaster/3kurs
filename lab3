@@ -1,0 +1,337 @@
+// scheduler_sim_extended.cpp
+// Компіль: g++ -std=c++17 scheduler_sim_extended.cpp -O2 -o scheduler_sim_extended
+//
+// Призначення: симулятор алгоритмів планування процесів: FCFS, RR, Priority(with aging), SJF.
+// Виводить статистику (avg waiting, avg turnaround, avg response), а також лог виконання.
+// Може зберегти порівняльні результати у CSV "results.csv".
+#include <bits/stdc++.h>
+using namespace std;
+
+struct Process {
+    int id;
+    int arrival;       // час прибуття
+    int burst;         // початковий burst (CPU time)
+    int remaining;     // залишковий час
+    int priority;      // більша = вищий пріоритет
+    int start_time;    // перший час початку (response)
+    int finish_time;   // час завершення
+    int last_wait_update_time; // для aging tracking
+    bool finished;
+
+    Process() = default;
+    Process(int _id, int a, int b, int p)
+        : id(_id), arrival(a), burst(b), remaining(b), priority(p),
+          start_time(-1), finish_time(-1), last_wait_update_time(a), finished(false) {}
+};
+
+struct Stats {
+    double avg_wait;
+    double avg_turnaround;
+    double avg_response;
+    int completed;
+};
+
+void print_proc_table(const vector<Process>& v, const string &title) {
+    cout << "=== " << title << " ===\n";
+    cout << "ID\tArr\tBurst\tPri\tStart\tFinish\tWait\tTurnaround\tResponse\n";
+    for (auto &p: v) {
+        int wait = (p.finish_time >= 0) ? (p.finish_time - p.arrival - p.burst) : -1;
+        int tat  = (p.finish_time >= 0) ? (p.finish_time - p.arrival) : -1;
+        int resp = (p.start_time >= 0) ? (p.start_time - p.arrival) : -1;
+        cout << p.id << '\t' << p.arrival << '\t' << p.burst << '\t' << p.priority << '\t'
+             << p.start_time << '\t' << p.finish_time << '\t'
+             << wait << '\t' << tat << '\t' << resp << '\n';
+    }
+    cout << endl;
+}
+
+// Helpers: compute stats given finished processes
+Stats compute_stats(const vector<Process>& procs) {
+    double total_wait = 0, total_tat = 0, total_resp = 0;
+    int completed = 0;
+    for (auto &p: procs) {
+        if (!p.finished) continue;
+        int wait = p.finish_time - p.arrival - p.burst;
+        int tat  = p.finish_time - p.arrival;
+        int resp = p.start_time - p.arrival;
+        total_wait += wait;
+        total_tat += tat;
+        total_resp += resp;
+        completed++;
+    }
+    if (completed == 0) return {0,0,0,0};
+    return { total_wait / completed, total_tat / completed, total_resp / completed, completed };
+}
+
+// FCFS non-preemptive
+Stats simulate_fcfs(vector<Process> procs, bool verbose = true) {
+    sort(procs.begin(), procs.end(), [](const Process&a,const Process&b){
+        if (a.arrival != b.arrival) return a.arrival < b.arrival;
+        return a.id < b.id;
+    });
+    int time = 0;
+    for (auto &p : procs) {
+        if (time < p.arrival) time = p.arrival;
+        if (p.start_time == -1) p.start_time = time;
+        time += p.burst;
+        p.remaining = 0;
+        p.finish_time = time;
+        p.finished = true;
+    }
+    if (verbose) print_proc_table(procs, "FCFS");
+    return compute_stats(procs);
+}
+
+// Round Robin (time quantum), supports dynamic arrival injection disabled here for clarity
+Stats simulate_rr(vector<Process> initial, int quantum, bool verbose = true) {
+    vector<Process> procs = initial;
+    // sort initial by arrival
+    sort(procs.begin(), procs.end(), [](const Process&a,const Process&b){
+        if (a.arrival != b.arrival) return a.arrival < b.arrival;
+        return a.id < b.id;
+    });
+    int n = procs.size();
+    queue<int> q;
+    int time = 0;
+    int idx = 0;
+    // push arrivals at time
+    auto push_arrivals = [&](int t){
+        while (idx < n && procs[idx].arrival <= t) {
+            q.push(idx++);
+        }
+    };
+    push_arrivals(time);
+    while (!q.empty() || idx < n) {
+        if (q.empty()) {
+            time = max(time, procs[idx].arrival);
+            push_arrivals(time);
+            continue;
+        }
+        int cur = q.front(); q.pop();
+        Process &p = procs[cur];
+        if (p.start_time == -1) p.start_time = time;
+        int slice = min(quantum, p.remaining);
+        p.remaining -= slice;
+        time += slice;
+        push_arrivals(time);
+        if (p.remaining == 0) {
+            p.finish_time = time;
+            p.finished = true;
+        } else {
+            q.push(cur);
+        }
+    }
+    if (verbose) print_proc_table(procs, "Round Robin (quantum=" + to_string(quantum) + ")");
+    return compute_stats(procs);
+}
+
+// Priority Scheduling (non-preemptive), with improved aging:
+// aging_interval: time units waited after which priority increases by aging_increment
+// higher value of priority = higher precedence
+Stats simulate_priority_aging(vector<Process> initial, int aging_interval, int aging_increment,
+                              bool verbose = true)
+{
+    vector<Process> procs = initial;
+    sort(procs.begin(), procs.end(), [](const Process&a,const Process&b){
+        if (a.arrival != b.arrival) return a.arrival < b.arrival;
+        return a.id < b.id;
+    });
+
+    int n = procs.size();
+    int time = 0;
+    int idx = 0;
+    vector<int> ready; // indices of procs that have arrived and not finished
+
+    auto push_arrivals = [&](int t){
+        while (idx < n && procs[idx].arrival <= t) {
+            procs[idx].last_wait_update_time = t;
+            ready.push_back(idx++);
+        }
+    };
+
+    push_arrivals(time);
+
+    while (!ready.empty() || idx < n) {
+        if (ready.empty()) {
+            time = max(time, procs[idx].arrival);
+            push_arrivals(time);
+            continue;
+        }
+
+        // Apply aging BEFORE choosing next: increase priority for waiting processes
+        for (int ridx : ready) {
+            int waited = time - procs[ridx].last_wait_update_time;
+            if (waited >= aging_interval) {
+                int times = waited / aging_interval;
+                procs[ridx].priority += times * aging_increment;
+                procs[ridx].last_wait_update_time += times * aging_interval;
+                // cap priority to some reasonable limit
+                if (procs[ridx].priority > 1000) procs[ridx].priority = 1000;
+            }
+        }
+
+        // choose index in ready with highest priority, tie -> earlier arrival -> smaller id
+        sort(ready.begin(), ready.end(), [&](int a, int b){
+            if (procs[a].priority != procs[b].priority) return procs[a].priority > procs[b].priority;
+            if (procs[a].arrival != procs[b].arrival) return procs[a].arrival < procs[b].arrival;
+            return procs[a].id < procs[b].id;
+        });
+
+        int cur = ready.front();
+        ready.erase(ready.begin());
+        Process &p = procs[cur];
+        if (time < p.arrival) time = p.arrival;
+        if (p.start_time == -1) p.start_time = time;
+        // run to completion (non-preemptive)
+        time += p.remaining;
+        p.remaining = 0;
+        p.finish_time = time;
+        p.finished = true;
+
+        // update last_wait_update_time for processes that are still waiting to now (they waited while we executed)
+        for (int ridx : ready) {
+            // they effectively waited additional (p.burst) time, but last_wait_update_time used relatively above
+            // do nothing here; aging will be applied at next iteration based on (time - last_wait_update_time)
+        }
+
+        // push arrivals that happened while we executed
+        push_arrivals(time);
+    }
+
+    if (verbose) print_proc_table(procs, "Priority (non-preemptive) with Aging (interval=" + to_string(aging_interval) + ", inc=" + to_string(aging_increment) + ")");
+    return compute_stats(procs);
+}
+
+// SJF (Shortest Job First) - non-preemptive: select ready process with smallest burst (or remaining)
+Stats simulate_sjf_nonpreemptive(vector<Process> initial, bool verbose = true) {
+    vector<Process> procs = initial;
+    sort(procs.begin(), procs.end(), [](const Process&a,const Process&b){
+        if (a.arrival != b.arrival) return a.arrival < b.arrival;
+        return a.id < b.id;
+    });
+
+    int time = 0, idx = 0, n = procs.size();
+    vector<int> ready;
+
+    auto push_arrivals = [&](int t){
+        while (idx < n && procs[idx].arrival <= t) {
+            ready.push_back(idx++);
+        }
+    };
+
+    push_arrivals(time);
+
+    while (!ready.empty() || idx < n) {
+        if (ready.empty()) {
+            time = max(time, procs[idx].arrival);
+            push_arrivals(time);
+            continue;
+        }
+
+        // pick SJF: minimal burst (tie -> earlier arrival -> smaller id)
+        sort(ready.begin(), ready.end(), [&](int a, int b){
+            if (procs[a].burst != procs[b].burst) return procs[a].burst < procs[b].burst;
+            if (procs[a].arrival != procs[b].arrival) return procs[a].arrival < procs[b].arrival;
+            return procs[a].id < procs[b].id;
+        });
+
+        int cur = ready.front();
+        ready.erase(ready.begin());
+        Process &p = procs[cur];
+
+        if (time < p.arrival) time = p.arrival;
+        if (p.start_time == -1) p.start_time = time;
+        time += p.remaining;
+        p.remaining = 0;
+        p.finish_time = time;
+        p.finished = true;
+
+        push_arrivals(time);
+    }
+
+    if (verbose) print_proc_table(procs, "SJF (non-preemptive)");
+    return compute_stats(procs);
+}
+
+// Utility: generate random processes
+vector<Process> generate_random_processes(int count, int max_arrival, int min_burst, int max_burst,
+                                         int min_priority, int max_priority, mt19937 &rng)
+{
+    uniform_int_distribution<int> arrival_dist(0, max_arrival);
+    uniform_int_distribution<int> burst_dist(min_burst, max_burst);
+    uniform_int_distribution<int> pri_dist(min_priority, max_priority);
+    vector<Process> res;
+    for (int i=0;i<count;i++) {
+        int a = arrival_dist(rng);
+        int b = burst_dist(rng);
+        int p = pri_dist(rng);
+        res.emplace_back(i+1, a, b, p);
+    }
+    // sort by arrival to make deterministic ordering for initial lists
+    sort(res.begin(), res.end(), [](const Process&a,const Process&b){
+        if (a.arrival != b.arrival) return a.arrival < b.arrival;
+        return a.id < b.id;
+    });
+    return res;
+}
+
+int main(int argc, char** argv) {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
+    // Params (можна змінити через аргументи або прямо в коді)
+    int proc_count = 12;
+    int max_arrival = 10;
+    int min_burst = 1, max_burst = 12;
+    int min_priority = 1, max_priority = 5;
+    int rr_quantum = 3;
+    int aging_interval = 4; // time units after which aging increments priority
+    int aging_increment = 1;
+    unsigned seed = (unsigned)chrono::system_clock::now().time_since_epoch().count();
+
+    if (argc >= 2) {
+        try { seed = stoul(argv[1]); } catch(...) {}
+    }
+    if (argc >= 3) {
+        try { proc_count = stoi(argv[2]); } catch(...) {}
+    }
+
+    mt19937 rng(seed);
+    cout << "Scheduler simulator extended (seed=" << seed << ")\n\n";
+
+    auto initial = generate_random_processes(proc_count, max_arrival, min_burst, max_burst, min_priority, max_priority, rng);
+
+    cout << "Initial process set:\n";
+    print_proc_table(initial, "Initial Processes");
+
+    // Run simulations
+    Stats s_fcfs = simulate_fcfs(initial);
+    Stats s_rr   = simulate_rr(initial, rr_quantum);
+    Stats s_pri  = simulate_priority_aging(initial, aging_interval, aging_increment);
+    Stats s_sjf  = simulate_sjf_nonpreemptive(initial);
+
+    // Summary table
+    cout << "=== Summary Statistics ===\n";
+    cout << "Algorithm\tAvgWait\tAvgTurnaround\tAvgResponse\tCompleted\n";
+    cout << "FCFS\t\t" << s_fcfs.avg_wait << '\t' << s_fcfs.avg_turnaround << '\t' << s_fcfs.avg_response << '\t' << s_fcfs.completed << '\n';
+    cout << "RR(q="<<rr_quantum<<")\t" << s_rr.avg_wait << '\t' << s_rr.avg_turnaround << '\t' << s_rr.avg_response << '\t' << s_rr.completed << '\n';
+    cout << "Priority+Aging\t" << s_pri.avg_wait << '\t' << s_pri.avg_turnaround << '\t' << s_pri.avg_response << '\t' << s_pri.completed << '\n';
+    cout << "SJF\t\t" << s_sjf.avg_wait << '\t' << s_sjf.avg_turnaround << '\t' << s_sjf.avg_response << '\t' << s_sjf.completed << '\n';
+
+    // Save CSV for external plotting
+    ofstream csv("results.csv");
+    if (csv.is_open()) {
+        csv << "Algorithm,AvgWait,AvgTurnaround,AvgResponse,Completed\n";
+        csv << "FCFS," << s_fcfs.avg_wait << "," << s_fcfs.avg_turnaround << "," << s_fcfs.avg_response << "," << s_fcfs.completed << "\n";
+        csv << "RR,"   << s_rr.avg_wait   << "," << s_rr.avg_turnaround   << "," << s_rr.avg_response   << "," << s_rr.completed << "\n";
+        csv << "Priority," << s_pri.avg_wait << "," << s_pri.avg_turnaround << "," << s_pri.avg_response << "," << s_pri.completed << "\n";
+        csv << "SJF,"   << s_sjf.avg_wait  << "," << s_sjf.avg_turnaround  << "," << s_sjf.avg_response  << "," << s_sjf.completed << "\n";
+        csv.close();
+        cout << "\nSaved summary to results.csv (можна побудувати графіки з цього файлу)\n";
+    } else {
+        cout << "\nНе вдалося відкрити results.csv для запису.\n";
+    }
+
+    cout << "\nГотово.\n";
+    return 0;
+}
