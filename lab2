@@ -1,0 +1,362 @@
+// scheduler_sim.cpp
+// Компіль: g++ -std=c++17 scheduler_sim.cpp -O2 -o scheduler_sim
+#include <bits/stdc++.h>
+using namespace std;
+using ll = long long;
+
+struct Process {
+    int id;
+    int arrival;       // час прибуття
+    int burst;         // загальний час виконання (CPU burst)
+    int remaining;     // залишковий час
+    int priority;      // більша = вищий пріоритет (можна змінювати динамічно)
+    int start_time;    // коли вперше почали виконувати (-1 якщо ще не починали)
+    int finish_time;   // коли завершили
+    int total_wait;    // накопичений час очікування (для RR)
+    bool finished;
+
+    Process() = default;
+    Process(int _id, int a, int b, int p)
+        : id(_id), arrival(a), burst(b), remaining(b), priority(p),
+          start_time(-1), finish_time(-1), total_wait(0), finished(false) {}
+};
+
+// Статистика на кінець симуляції
+struct Stats {
+    double avg_wait;      // average waiting time
+    double avg_turnaround;// average turnaround (completion - arrival)
+    int completed;
+};
+
+void print_process_summary(const vector<Process>& procs) {
+    cout << "ID\tArr\tBurst\tPri\tStart\tFinish\tWait\tTurnaround\n";
+    for (auto &p: procs) {
+        int wait = (p.finish_time >= 0) ? (p.finish_time - p.arrival - p.burst) : -1;
+        int tat = (p.finish_time >= 0) ? (p.finish_time - p.arrival) : -1;
+        cout << p.id << '\t' << p.arrival << '\t' << p.burst << '\t' << p.priority
+             << '\t' << p.start_time << '\t' << p.finish_time << '\t'
+             << wait << '\t' << tat << '\n';
+    }
+    cout << '\n';
+}
+
+/*
+ * FCFS (First Come First Served) - non-preemptive
+ * returns stats and fills finish_time/start_time in procs (copy passed)
+ */
+Stats simulate_fcfs(vector<Process> procs) {
+    sort(procs.begin(), procs.end(), [](const Process& a, const Process& b) {
+        if (a.arrival != b.arrival) return a.arrival < b.arrival;
+        return a.id < b.id;
+    });
+
+    int time = 0;
+    double total_wait = 0;
+    double total_tat = 0;
+    int completed = 0;
+
+    for (auto &p : procs) {
+        if (time < p.arrival) time = p.arrival;
+        p.start_time = time;
+        time += p.burst;
+        p.finish_time = time;
+        int wait = p.start_time - p.arrival;
+        int tat = p.finish_time - p.arrival;
+        total_wait += wait;
+        total_tat += tat;
+        completed++;
+    }
+
+    // print summary
+    cout << "=== FCFS ===\n";
+    print_process_summary(procs);
+
+    return { total_wait / completed, total_tat / completed, completed };
+}
+
+/*
+ * Round Robin simulation
+ * quantum - time quantum
+ * dynamicNewArrivalProb - probability (0..1) to generate a new random process at every tick
+ * dynamicPriorityChange - if true, randomly change priority for running process occasionally
+ */
+Stats simulate_rr(vector<Process> initial, int quantum, mt19937 &rng,
+                  double dynamicNewArrivalProb = 0.0, bool dynamicPriorityChange = false,
+                  function<void(Process&)> on_new_process = nullptr)
+{
+    // work on a copy
+    vector<Process> procs = initial;
+    // sort initial pool by arrival
+    sort(procs.begin(), procs.end(), [](const Process& a, const Process& b){
+        if (a.arrival != b.arrival) return a.arrival < b.arrival;
+        return a.id < b.id;
+    });
+
+    queue<int> q; // store indices into procs vector for ready queue
+    int time = 0;
+    int idx = 0; // index for next arrival from sorted procs
+    int n = procs.size();
+    double total_wait = 0;
+    double total_tat = 0;
+    int completed = 0;
+
+    // helper: push arrivals at current time
+    auto push_arrivals = [&](int t){
+        while(idx < n && procs[idx].arrival <= t) {
+            q.push(idx++);
+        }
+    };
+
+    push_arrivals(time);
+
+    // supports dynamic adding of new processes during simulation
+    int next_id = procs.empty() ? 1 : (int)procs.back().id + 1;
+    uniform_real_distribution<double> uni(0.0, 1.0);
+    uniform_int_distribution<int> burst_dist(1, 10);
+    uniform_int_distribution<int> pri_dist(1, 5);
+    // For RR waiting time tracking we'll increment total_wait for everyone in queue during cpu usage
+    vector<int> last_enqueued_time; last_enqueued_time.resize(procs.size(), -1);
+
+    while(!q.empty() || idx < n) {
+        if (q.empty()) {
+            // fast-forward to next arrival
+            time = max(time, procs[idx].arrival);
+            push_arrivals(time);
+            continue;
+        }
+
+        int curIdx = q.front(); q.pop();
+        Process &p = procs[curIdx];
+
+        if (p.start_time == -1) p.start_time = time;
+
+        int slice = min(quantum, p.remaining);
+
+        // simulate slice tick-by-tick to allow dynamic events every time unit
+        for (int t = 0; t < slice; ++t) {
+            // on each tick we can add new processes with probability
+            double r = uni(rng);
+            if (dynamicNewArrivalProb > 0.0 && r < dynamicNewArrivalProb) {
+                Process newp(next_id++, time, burst_dist(rng), pri_dist(rng));
+                if (on_new_process) on_new_process(newp);
+                procs.push_back(newp);
+                last_enqueued_time.push_back(-1);
+                // push immediately to ready queue
+                q.push((int)procs.size() - 1);
+                cout << "[RR] New process arrived during simulation: ID=" << newp.id
+                     << " arrival=" << newp.arrival << " burst=" << newp.burst
+                     << " pri=" << newp.priority << " (time=" << time << ")\n";
+            }
+
+            // simulate one unit of CPU for p
+            p.remaining -= 1;
+            time += 1;
+
+            // push any scheduled arrivals whose arrival == current time (from initial list)
+            push_arrivals(time);
+        }
+
+        // after slice
+        if (p.remaining <= 0) {
+            p.finish_time = time;
+            p.finished = true;
+            int wait = p.finish_time - p.arrival - p.burst;
+            int tat = p.finish_time - p.arrival;
+            total_wait += wait;
+            total_tat += tat;
+            completed++;
+            cout << "[RR] Process " << p.id << " finished at t=" << time << " (turnaround=" << tat << " wait=" << wait << ")\n";
+        } else {
+            // dynamic priority change possibility
+            if (dynamicPriorityChange) {
+                // small chance to increase priority (simulate aging or boosting)
+                uniform_real_distribution<double> pr(0.0,1.0);
+                if (pr(rng) < 0.2) {
+                    p.priority = min(p.priority + 1, 10);
+                    cout << "[RR] Dynamic priority change: PID=" << p.id << " newPri=" << p.priority << " (time=" << time << ")\n";
+                }
+            }
+            // re-enqueue
+            q.push(curIdx);
+        }
+    }
+
+    cout << "\n=== RR Summary ===\n";
+    print_process_summary(procs);
+
+    return { total_wait / completed, total_tat / completed, completed };
+}
+
+/*
+ * Priority scheduling (non-preemptive)
+ * Higher priority value -> scheduled earlier
+ * dynamicPriorityChange: whether we simulate priority changes over time (aging)
+ * dynamicNewArrivalProb: probability to add new process at each scheduling decision
+ */
+Stats simulate_priority(vector<Process> initial, mt19937 &rng,
+                        bool dynamicPriorityChange = false,
+                        double dynamicNewArrivalProb = 0.0,
+                        function<void(Process&)> on_new_process = nullptr)
+{
+    vector<Process> procs = initial;
+    sort(procs.begin(), procs.end(), [](const Process& a, const Process& b){
+        if (a.arrival != b.arrival) return a.arrival < b.arrival;
+        return a.id < b.id;
+    });
+
+    int time = 0;
+    int n = procs.size();
+    int idx = 0; // next arrival index in procs
+    double total_wait = 0, total_tat = 0;
+    int completed = 0;
+
+    // ready list holds indices of arrived but not finished processes
+    vector<int> ready;
+
+    uniform_real_distribution<double> uni(0.0,1.0);
+    uniform_int_distribution<int> burst_dist(1,10);
+    uniform_int_distribution<int> pri_dist(1,5);
+    int next_id = procs.empty() ? 1 : procs.back().id + 1;
+
+    auto push_arrivals = [&](int t) {
+        while (idx < n && procs[idx].arrival <= t) {
+            ready.push_back(idx++);
+        }
+    };
+
+    push_arrivals(time);
+
+    while (!ready.empty() || idx < n) {
+        if (ready.empty()) {
+            time = max(time, procs[idx].arrival);
+            push_arrivals(time);
+            continue;
+        }
+
+        // choose highest priority (largest value). tie-breaker: earlier arrival then smaller id
+        sort(ready.begin(), ready.end(), [&](int a, int b){
+            if (procs[a].priority != procs[b].priority) return procs[a].priority > procs[b].priority;
+            if (procs[a].arrival != procs[b].arrival) return procs[a].arrival < procs[b].arrival;
+            return procs[a].id < procs[b].id;
+        });
+
+        int curIdx = ready.front();
+        // remove from ready
+        ready.erase(ready.begin());
+
+        Process &p = procs[curIdx];
+        if (time < p.arrival) time = p.arrival;
+        if (p.start_time == -1) p.start_time = time;
+
+        // possibly add new process during scheduling decision
+        double r = uni(rng);
+        if (dynamicNewArrivalProb > 0.0 && r < dynamicNewArrivalProb) {
+            Process newp(next_id++, time, burst_dist(rng), pri_dist(rng));
+            if (on_new_process) on_new_process(newp);
+            procs.push_back(newp);
+            ready.push_back((int)procs.size()-1);
+            cout << "[PRI] New process injected: ID=" << newp.id << " arrival=" << newp.arrival << " burst=" << newp.burst << " pri=" << newp.priority << '\n';
+        }
+
+        // run to completion (non-preemptive)
+        time += p.remaining;
+        p.remaining = 0;
+        p.finish_time = time;
+        p.finished = true;
+        int wait = p.start_time - p.arrival;
+        int tat = p.finish_time - p.arrival;
+        total_wait += wait;
+        total_tat += tat;
+        completed++;
+        cout << "[PRI] Executed PID=" << p.id << " pri=" << p.priority << " start=" << p.start_time << " finish=" << p.finish_time << '\n';
+
+        // push any newly arrived initial processes that arrived while we ran
+        push_arrivals(time);
+
+        // dynamic priority aging/changes
+        if (dynamicPriorityChange) {
+            for (int ridx : ready) {
+                // aging: slightly increase priority for waiting processes
+                if (procs[ridx].priority < 20) procs[ridx].priority += 1;
+            }
+            cout << "[PRI] Applied aging to waiting processes (time=" << time << ")\n";
+        }
+    }
+
+    cout << "\n=== Priority Summary ===\n";
+    print_process_summary(procs);
+
+    return { total_wait / completed, total_tat / completed, completed };
+}
+
+// Helper: generate initial random processes
+vector<Process> generate_random_processes(int count, int max_arrival, int min_burst, int max_burst, int max_priority, mt19937 &rng) {
+    vector<Process> res;
+    uniform_int_distribution<int> arrival_dist(0, max_arrival);
+    uniform_int_distribution<int> burst_dist(min_burst, max_burst);
+    uniform_int_distribution<int> pri_dist(1, max_priority);
+    for (int i = 0; i < count; ++i) {
+        int a = arrival_dist(rng);
+        int b = burst_dist(rng);
+        int p = pri_dist(rng);
+        res.emplace_back(i+1, a, b, p);
+    }
+    // sort by arrival to make it nicer for output
+    sort(res.begin(), res.end(), [](const Process& A, const Process& B){
+        if (A.arrival != B.arrival) return A.arrival < B.arrival;
+        return A.id < B.id;
+    });
+    return res;
+}
+
+int main(int argc, char** argv) {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
+    // optional seed for reproducibility
+    unsigned seed = (unsigned)chrono::system_clock::now().time_since_epoch().count();
+    if (argc >= 2) {
+        try { seed = stoi(argv[1]); } catch(...) {}
+    }
+    mt19937 rng(seed);
+
+    cout << "Scheduler simulator (seed=" << seed << ")\n";
+
+    // параметры генерации
+    int initial_count = 8;
+    int max_arrival = 10;   // arrival times in [0, max_arrival]
+    int min_burst = 2, max_burst = 8;
+    int max_priority = 5;
+
+    // generate initial processes
+    auto initial = generate_random_processes(initial_count, max_arrival, min_burst, max_burst, max_priority, rng);
+
+    cout << "\nInitial process list:\n";
+    print_process_summary(initial);
+
+    // simulate FCFS
+    Stats fcfs_stats = simulate_fcfs(initial);
+    cout << "FCFS avg wait = " << fcfs_stats.avg_wait << ", avg turnaround = " << fcfs_stats.avg_turnaround << "\n\n";
+
+    // simulate RR
+    int quantum = 3;
+    // in RR we allow dynamic new arrivals with small probability (0.05) and dynamic priority change true
+    Stats rr_stats = simulate_rr(initial, quantum, rng, 0.05, true,
+        [](Process &p){ /* on new process hook: nothing special */ });
+    cout << "RR (quantum=" << quantum << ") avg wait = " << rr_stats.avg_wait << ", avg turnaround = " << rr_stats.avg_turnaround << "\n\n";
+
+    // simulate Priority with aging and dynamic arrivals
+    Stats pri_stats = simulate_priority(initial, rng, true, 0.03,
+        [](Process &p){ /* hook */ });
+    cout << "Priority (non-preemptive, aging) avg wait = " << pri_stats.avg_wait << ", avg turnaround = " << pri_stats.avg_turnaround << "\n\n";
+
+    // comparison summary
+    cout << "=== Comparison ===\n";
+    cout << "Algorithm\tAvgWait\tAvgTurnaround\n";
+    cout << "FCFS\t\t" << fcfs_stats.avg_wait << "\t" << fcfs_stats.avg_turnaround << '\n';
+    cout << "RR(q="<<quantum<<")\t" << rr_stats.avg_wait << "\t" << rr_stats.avg_turnaround << '\n';
+    cout << "Priority\t" << pri_stats.avg_wait << "\t" << pri_stats.avg_turnaround << '\n';
+
+    cout << "\nГотово.\n";
+    return 0;
+}
